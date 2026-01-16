@@ -11,7 +11,7 @@ v2.7.0 (2025-11-03)
 
 v2.6.2 (2025-11-03)
   - 新增: 括号格式支持 (时间1, 时间2) 文本
-  - 示例: (0.0, 0.26) 大雄，
+  - 示例: (0.0, 0.26) 大熊，
   - 默认: 字幕格式改为"括号格式"，更简洁直观
 
 v2.5.4 (2025-11-02)
@@ -129,6 +129,13 @@ import re
 import gc
 from collections import OrderedDict
 from typing import Tuple, Dict, Any, Optional, List
+import shutil
+import subprocess
+import folder_paths
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 class SubtitleSegment:
     """字幕片段数据类（增强版）"""
@@ -169,10 +176,10 @@ class VideoSubtitleTimestampProNode:
                     "default": "括号格式"
                 }),
                 "字幕内容": ("STRING", {
-                    "default": """(0.0, 0.26) 大雄，
-(0.3, 1.4) 我来参加投稿了，
-(1.5, 2.26) 快告诉我，
-(2.32, 2.94) 第一名是我。""",
+                    "default": """(0.0, 2.0) 这是视频添加时间戳字幕的节点
+(2.0, 4.0) 作者网名：HAIGC(全网同名)
+(4.0, 6.0) 作者微信号：HAIGC1994
+(6.0, 8.0) 剪映接口只有早上到下午3点左右可以用""",
                     "multiline": True
                 }),
                 "视频帧率": ("FLOAT", {
@@ -218,6 +225,12 @@ class VideoSubtitleTimestampProNode:
                     "max": 300,
                     "step": 1
                 }),
+                "最大行数": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1
+                }),
                 "字体粗细": (["常规", "粗体", "特粗", "超粗"], {
                     "default": "常规"
                 }),
@@ -226,7 +239,7 @@ class VideoSubtitleTimestampProNode:
                     "multiline": False
                 }),
                 "描边大小": ("INT", {
-                    "default": 3,
+                    "default": 1,
                     "min": 0,
                     "max": 50,
                     "step": 1
@@ -332,7 +345,7 @@ class VideoSubtitleTimestampProNode:
             },
             "optional": {
                 # === 🌈 渐变色设置 ===
-                "渐变色数量": (["无", "2", "3"], {
+                "渐变色数量": (["无", "1", "2", "3"], {
                     "default": "无"
                 }),
                 "渐变色1": ("STRING", {
@@ -1040,24 +1053,24 @@ class VideoSubtitleTimestampProNode:
     
     def create_bold_text(self, draw: ImageDraw.ImageDraw, position: Tuple[int, int], 
                         text: str, font: ImageFont.FreeTypeFont, 
-                        fill, bold_level: str, anchor: str = "mm"):
+                        fill, bold_level: str, anchor: str = "mm", align: str = "left"):
         """创建加粗文字（优化版）"""
         x, y = position
         
         if bold_level == "常规":
-            draw.text((x, y), text, font=font, fill=fill, anchor=anchor)
+            draw.text((x, y), text, font=font, fill=fill, anchor=anchor, align=align)
         elif bold_level == "粗体":
             offsets = [(0, 0), (1, 0), (0, 1), (1, 1)]
             for dx, dy in offsets:
-                draw.text((x + dx, y + dy), text, font=font, fill=fill, anchor=anchor)
+                draw.text((x + dx, y + dy), text, font=font, fill=fill, anchor=anchor, align=align)
         elif bold_level == "特粗":
             offsets = [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (0, 2), (1, 2)]
             for dx, dy in offsets:
-                draw.text((x + dx, y + dy), text, font=font, fill=fill, anchor=anchor)
+                draw.text((x + dx, y + dy), text, font=font, fill=fill, anchor=anchor, align=align)
         elif bold_level == "超粗":
             offsets = [(dx, dy) for dx in range(-1, 3) for dy in range(-1, 3)]
             for dx, dy in offsets:
-                draw.text((x + dx, y + dy), text, font=font, fill=fill, anchor=anchor)
+                draw.text((x + dx, y + dy), text, font=font, fill=fill, anchor=anchor, align=align)
     
     def create_projection(self, text_img: Image.Image, angle: int, 
                          distance: int, intensity: float, blur: int) -> Image.Image:
@@ -1104,47 +1117,25 @@ class VideoSubtitleTimestampProNode:
                             gradient_colors: List[Tuple[int, int, int]], direction: str,
                             stroke_color: Tuple[int, int, int], stroke_size: int,
                             width: int, height: int, align: str = "居中", 
-                            x_percent: float = 50.0, bold_level: str = "常规") -> Image.Image:
-        """创建渐变色文字
-        
-        Args:
-            text: 文本
-            font: 字体
-            gradient_colors: 渐变色列表
-            direction: 渐变方向（横向/竖向/对角）
-            stroke_color: 描边颜色
-            stroke_size: 描边大小
-            width: 画布宽度
-            height: 画布高度
-            align: 对齐方式
-            x_percent: X位置百分比
-        
-        Returns:
-            渐变文字图像
-        """
+                            x_percent: float = 50.0, bold_level: str = "常规",
+                            visible_chars: int = -1) -> Image.Image:
+        """创建渐变色文字（支持对齐方式和字体粗细，多行居中优化）"""
         text_layer = Image.new('RGBA', (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(text_layer)
         
-        # 计算文本位置
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-        
-        # 根据对齐方式计算X位置
-        x_pos = int(width * x_percent / 100.0)
+        # 映射对齐方式
+        pil_align = "left"
         if align == "居中":
-            anchor = "mm"
-            center_x = x_pos
+            pil_align = "center"
         elif align == "左对齐":
-            anchor = "lm"
-            center_x = x_pos
-        else:  # 右对齐
-            anchor = "rm"
-            center_x = x_pos
+            pil_align = "left"
+        elif align == "右对齐":
+            pil_align = "right"
+            
+        # 预计算文字位置（统一使用 _calculate_multiline_metrics）
+        char_positions, _, _ = self._calculate_multiline_metrics(draw, text, font, 0, pil_align, width, height)
         
-        center_y = height // 2
-        
-        # 高质量描边算法（与普通文字一致）
+        # 绘制描边
         if stroke_size > 0:
             stroke_rgba = stroke_color + (255,)
             
@@ -1158,7 +1149,7 @@ class VideoSubtitleTimestampProNode:
             else:
                 angle_step = 15
             
-            # 预计算偏移量并去重
+            # 优化：预计算偏移量
             offsets = []
             for angle in range(0, 360, int(angle_step)):
                 rad = math.radians(angle)
@@ -1170,23 +1161,28 @@ class VideoSubtitleTimestampProNode:
                     if (offset_x, offset_y) not in offsets:
                         offsets.append((offset_x, offset_y))
             
-            # 批量绘制描边（支持字体粗细）
+            # 批量绘制描边
             for offset_x, offset_y in offsets:
-                if bold_level == "常规":
-                    draw.text((center_x + offset_x, center_y + offset_y), 
-                             text, font=font, fill=stroke_rgba, anchor=anchor)
-                else:
-                    self.create_bold_text(draw, (center_x + offset_x, center_y + offset_y), 
-                                        text, font, stroke_rgba, bold_level, anchor)
+                for i, (char, x, y) in enumerate(char_positions):
+                    if visible_chars >= 0 and i >= visible_chars:
+                        break
+                    if bold_level == "常规":
+                        draw.text((x + offset_x, y + offset_y), char, font=font, fill=stroke_rgba, anchor='mm')
+                    else:
+                        self.create_bold_text(draw, (x + offset_x, y + offset_y), char, font, stroke_rgba, bold_level, anchor='mm')
         
-        # 创建渐变蒙版（支持字体粗细）
+        # 创建渐变蒙版
         gradient_mask = Image.new('L', (width, height), 0)
         gradient_draw = ImageDraw.Draw(gradient_mask)
         
-        if bold_level == "常规":
-            gradient_draw.text((center_x, center_y), text, font=font, fill=255, anchor=anchor)
-        else:
-            self.create_bold_text(gradient_draw, (center_x, center_y), text, font, 255, bold_level, anchor)
+        # 绘制蒙版文字
+        for i, (char, x, y) in enumerate(char_positions):
+            if visible_chars >= 0 and i >= visible_chars:
+                break
+            if bold_level == "常规":
+                gradient_draw.text((x, y), char, font=font, fill=255, anchor='mm')
+            else:
+                self.create_bold_text(gradient_draw, (x, y), char, font, 255, bold_level, anchor='mm')
         
         # 创建渐变图层
         gradient_layer = Image.new('RGB', (width, height))
@@ -1213,55 +1209,124 @@ class VideoSubtitleTimestampProNode:
         
         return text_layer
     
+    def _calculate_multiline_metrics(self, draw, text, font, spacing, align, width, height):
+        """辅助函数：计算多行文字每个字符的位置"""
+        lines = text.split('\n')
+        line_metrics = []
+        max_block_width = 0
+        total_text_height = 0
+        
+        bbox = draw.textbbox((0, 0), "A", font=font)
+        default_line_height = bbox[3] - bbox[1]
+        line_gap = int(default_line_height * 0.2) # 行间距
+        
+        # 第一遍：计算尺寸
+        for i, line in enumerate(lines):
+            if not line:
+                line_metrics.append({'chars': [], 'width': 0, 'height': default_line_height})
+                total_text_height += default_line_height
+            else:
+                chars = list(line)
+                char_widths = []
+                max_line_height = 0
+                for char in chars:
+                    bbox = draw.textbbox((0, 0), char, font=font)
+                    char_widths.append(bbox[2] - bbox[0])
+                    max_line_height = max(max_line_height, bbox[3] - bbox[1])
+                
+                total_line_width = sum(char_widths) + (len(chars) - 1) * max(0, spacing)
+                line_metrics.append({
+                    'chars': chars,
+                    'char_widths': char_widths,
+                    'width': total_line_width,
+                    'height': max_line_height
+                })
+                max_block_width = max(max_block_width, total_line_width)
+                total_text_height += max_line_height
+            
+            if i < len(lines) - 1:
+                total_text_height += line_gap
+
+        # 垂直居中起始Y
+        current_y = (height - total_text_height) // 2
+        
+        # 块级水平位置（默认居中于画布）
+        block_start_x = (width - max_block_width) // 2
+        
+        char_positions = []
+        
+        # 第二遍：计算位置
+        for metric in line_metrics:
+            if not metric['chars']:
+                current_y += metric['height'] + line_gap
+                continue
+            
+            # 计算当前行X
+            if align == 'center':
+                start_x = (width - metric['width']) // 2
+            elif align == 'right':
+                start_x = block_start_x + (max_block_width - metric['width'])
+            else: # left
+                start_x = block_start_x
+            
+            current_x = start_x
+            for char, char_w in zip(metric['chars'], metric['char_widths']):
+                char_center_x = current_x + char_w // 2
+                char_center_y = current_y + metric['height'] // 2
+                char_positions.append((char, char_center_x, char_center_y))
+                current_x += char_w + max(0, spacing)
+            
+            current_y += metric['height'] + line_gap
+            
+        return char_positions, max_block_width, total_text_height
+
+    def _draw_multiline_text_with_spacing(self, draw, text, font, fill, width, height, spacing, align, bold_level, visible_chars=-1):
+        """辅助函数：绘制多行带字间距文字"""
+        char_positions, _, _ = self._calculate_multiline_metrics(draw, text, font, spacing, align, width, height)
+        
+        for i, (char, x, y) in enumerate(char_positions):
+            if visible_chars >= 0 and i >= visible_chars:
+                break
+            if bold_level == "常规":
+                draw.text((x, y), char, font=font, fill=fill, anchor='mm')
+            else:
+                self.create_bold_text(draw, (x, y), char, font, fill, bold_level, anchor='mm')
+
     def create_stroke_text(self, text: str, font: ImageFont.FreeTypeFont, 
                           text_color: Tuple[int, int, int], stroke_color: Tuple[int, int, int], 
                           stroke_size: int, width: int, height: int, 
-                          align: str = "居中", x_percent: float = 50.0, bold_level: str = "常规") -> Image.Image:
-        """创建描边文字（支持对齐方式和字体粗细）"""
+                          align: str = "居中", x_percent: float = 50.0, bold_level: str = "常规",
+                          visible_chars: int = -1) -> Image.Image:
+        """创建描边文字（支持对齐方式和字体粗细，多行居中优化）"""
         text_layer = Image.new('RGBA', (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(text_layer)
         
-        # 计算文本尺寸
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-        
-        # 根据对齐方式计算X位置
-        x_pos = int(width * x_percent / 100.0)
-        
+        # 映射对齐方式
+        pil_align = "left"
         if align == "居中":
-            anchor = "mm"
-            center_x = x_pos
+            pil_align = "center"
         elif align == "左对齐":
-            anchor = "lm"
-            center_x = x_pos
-        else:  # 右对齐
-            anchor = "rm"
-            center_x = x_pos
-        
-        center_y = height // 2
-        
+            pil_align = "left"
+        elif align == "右对齐":
+            pil_align = "right"
+            
         if stroke_size == 0:
-            # 无描边，直接绘制文字（支持字体粗细）
-            if bold_level == "常规":
-                draw.text((center_x, center_y), text, font=font, 
-                         fill=text_color + (255,), anchor=anchor)
-            else:
-                self.create_bold_text(draw, (center_x, center_y), text, font, 
-                                    text_color + (255,), bold_level, anchor)
+            # 无描边
+            self._draw_multiline_text_with_spacing(draw, text, font, text_color + (255,), 
+                                                 width, height, 0, pil_align, bold_level, visible_chars)
         else:
-            # 高质量描边算法（性能优化版 + 支持字体粗细）
+            # 有描边
             stroke_rgba = stroke_color + (255,)
             
             # 智能采样策略
             if stroke_size <= 2:
-                angle_step = 45  # 8个方向
+                angle_step = 45
             elif stroke_size <= 5:
-                angle_step = 30  # 12个方向
+                angle_step = 30
             elif stroke_size <= 10:
-                angle_step = 22.5  # 16个方向
+                angle_step = 22.5
             else:
-                angle_step = 15  # 24个方向
+                angle_step = 15
             
             # 优化：预计算偏移量
             offsets = []
@@ -1272,25 +1337,30 @@ class VideoSubtitleTimestampProNode:
                 for distance in range(1, stroke_size + 1):
                     offset_x = int(cos_val * distance)
                     offset_y = int(sin_val * distance)
-                    if (offset_x, offset_y) not in offsets:  # 去重
+                    if (offset_x, offset_y) not in offsets:
                         offsets.append((offset_x, offset_y))
             
-            # 批量绘制描边（支持字体粗细）
-            for offset_x, offset_y in offsets:
-                if bold_level == "常规":
-                    draw.text((center_x + offset_x, center_y + offset_y), 
-                             text, font=font, fill=stroke_rgba, anchor=anchor)
-                else:
-                    self.create_bold_text(draw, (center_x + offset_x, center_y + offset_y), 
-                                        text, font, stroke_rgba, bold_level, anchor)
+            # 计算文字位置
+            char_positions, _, _ = self._calculate_multiline_metrics(draw, text, font, 0, pil_align, width, height)
             
-            # 绘制文字（支持字体粗细）
-            if bold_level == "常规":
-                draw.text((center_x, center_y), text, font=font, 
-                         fill=text_color + (255,), anchor=anchor)
-            else:
-                self.create_bold_text(draw, (center_x, center_y), text, font, 
-                                    text_color + (255,), bold_level, anchor)
+            # 批量绘制描边
+            for offset_x, offset_y in offsets:
+                for i, (char, x, y) in enumerate(char_positions):
+                    if visible_chars >= 0 and i >= visible_chars:
+                        break
+                    if bold_level == "常规":
+                        draw.text((x + offset_x, y + offset_y), char, font=font, fill=stroke_rgba, anchor='mm')
+                    else:
+                        self.create_bold_text(draw, (x + offset_x, y + offset_y), char, font, stroke_rgba, bold_level, anchor='mm')
+            
+            # 绘制文字
+            for i, (char, x, y) in enumerate(char_positions):
+                if visible_chars >= 0 and i >= visible_chars:
+                    break
+                if bold_level == "常规":
+                    draw.text((x, y), char, font=font, fill=text_color + (255,), anchor='mm')
+                else:
+                    self.create_bold_text(draw, (x, y), char, font, text_color + (255,), bold_level, anchor='mm')
         
         return text_layer
     
@@ -1618,10 +1688,150 @@ class VideoSubtitleTimestampProNode:
                 print(f"[画布限定] 字幕完全超出画布范围")
         
         return text_img, paste_x, paste_y
+
+    def _build_srt_from_segments(self, segments: List[SubtitleSegment]) -> str:
+        out_dir = folder_paths.get_output_directory()
+        srt_path = os.path.join(out_dir, f"subtitle_{os.urandom(4).hex()}.srt")
+        lines = []
+        for seg in segments:
+            lines.append(str(seg.index))
+            lines.append(f"{self._seconds_to_srt(seg.start_time)} --> {self._seconds_to_srt(seg.end_time)}")
+            lines.append(seg.text)
+            lines.append("")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return srt_path
+
+    def _seconds_to_srt(self, t: float) -> str:
+        t = max(0.0, t)
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        ms = int(round((t - int(t)) * 1000))
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    def _run_ffmpeg_burn(self, src_path: str, srt_path: str, container: str,
+                         字体名称: str, 字体大小: int, 描边大小: int,
+                         位置预设: str, y_percent: float, 视频质量: str):
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            raise RuntimeError("未找到 ffmpeg")
+        out_dir = folder_paths.get_output_directory()
+        base_name = os.path.splitext(os.path.basename(src_path))[0]
+        out_ext = "mp4" if container == "mp4" else "mkv"
+        out_path = os.path.join(out_dir, f"{base_name}_sub_{os.urandom(3).hex()}.{out_ext}")
+        align_map = {
+            "底部居中": "2",
+            "顶部居中": "6",
+            "左下角": "1",
+            "右下角": "3",
+            "左上角": "5",
+            "右上角": "7",
+            "正中央": "9",
+            "底部三分之一": "2",
+            "顶部三分之一": "6",
+            "自定义": "2",
+        }
+        align_val = align_map.get(位置预设, "2")
+        font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font")
+        margin_v = 20
+        if 位置预设 in ["底部居中", "底部三分之一", "自定义"]:
+            margin_v = max(0, int((100.0 - y_percent) / 100.0 * 1080))
+        elif 位置预设 in ["顶部居中", "顶部三分之一"]:
+            margin_v = max(0, int(y_percent / 100.0 * 1080))
+        quality_map = {"高": ("18", "fast"), "中": ("23", "medium"), "低": ("28", "slow")}
+        crf, preset = quality_map.get(视频质量, ("23", "medium"))
+        vf_arg = f"subtitles={srt_path}:fontsdir={font_dir}:force_style='FontName={字体名称},FontSize={字体大小},Outline={描边大小},Alignment={align_val},MarginV={margin_v}'"
+        esc_srt = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        esc_font = font_dir.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        vf_arg = f"subtitles={esc_srt}:fontsdir={esc_font}:force_style='FontName={字体名称},FontSize={字体大小},Outline={描边大小},Alignment={align_val},MarginV={margin_v}'"
+        cmd = [
+            ffmpeg_path, "-y",
+            "-i", src_path,
+            "-vf", vf_arg,
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-crf", crf,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            out_path
+        ]
+        result = subprocess.run(cmd, capture_output=True)
+        try:
+            os.remove(srt_path)
+        except:
+            pass
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, (bytes, bytearray)) else (result.stderr or "")
+            if not stderr:
+                stdout = result.stdout.decode("utf-8", errors="ignore") if isinstance(result.stdout, (bytes, bytearray)) else (result.stdout or "")
+                stderr = stdout
+            raise RuntimeError(f"FFmpeg执行失败: {stderr[-800:]}")
+        return self._load_video_result(out_path)
+
+    def _load_video_result(self, video_path: str):
+        if cv2 is None:
+            raise ImportError("需要 opencv-python")
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise Exception("无法打开生成的视频文件")
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = frame.astype(np.float32) / 255.0
+            frames.append(frame)
+        cap.release()
+        if not frames:
+            raise Exception("未读取到帧")
+        images = torch.from_numpy(np.stack(frames, axis=0))
+        return images
     
+    def wrap_text_smart(self, text: str, font: ImageFont.FreeTypeFont, max_width: int, max_lines: int) -> str:
+        """智能文本换行"""
+        if max_lines <= 1 or not text or '\n' in text:
+            return text
+        
+        try:
+            draw = ImageDraw.Draw(Image.new('L', (1, 1)))
+        except Exception:
+            return text
+        
+        lines: List[str] = []
+        current = ""
+        
+        for idx, ch in enumerate(text):
+            next_current = current + ch
+            try:
+                bbox = draw.textbbox((0, 0), next_current, font=font)
+                next_width = bbox[2] - bbox[0]
+            except Exception:
+                next_width = 0
+            
+            if current and next_width > max_width:
+                lines.append(current)
+                if len(lines) >= max_lines - 1:
+                    remaining = text[idx:]
+                    lines.append(remaining)
+                    return "\n".join(lines)
+                current = ch
+            else:
+                current = next_current
+        
+        if current:
+            lines.append(current)
+        
+        if len(lines) <= 1:
+            return text
+        
+        return "\n".join(lines)
+
     def add_subtitle_pro(self, images, 字幕格式, 字幕内容, 视频帧率,
                         开始时间, 结束时间, 每段显示时长, 字幕间隔,
-                        字体选择, 字体大小, 字体粗细, 字体颜色, 
+                        字体选择, 字体大小, 最大行数, 字体粗细, 字体颜色, 
                         描边大小, 描边颜色, 不透明度,
                         投影角度, 投影距离, 投影强度, 投影模糊,
                         位置预设, 位置X百分比, 位置Y百分比, 对齐方式,
@@ -1654,6 +1864,14 @@ class VideoSubtitleTimestampProNode:
         if font is None:
             print("错误: 字体加载失败")
             return (images, 开始时间, 结束时间)
+            
+        # 智能换行处理
+        if 动画特效 != "滚动字幕" and 最大行数 > 1 and segments:
+            # 留5%边距
+            wrap_width = int(width * 0.9)
+            print(f"[智能换行] 最大行数: {最大行数}, 限制宽度: {wrap_width}px")
+            for seg in segments:
+                seg.text = self.wrap_text_smart(seg.text, font, wrap_width, 最大行数)
         
         # 解析颜色
         text_color = self.parse_color(字体颜色)
@@ -1806,6 +2024,22 @@ class VideoSubtitleTimestampProNode:
                 else:
                     print(f"[画布限定] ✓ 统一字号: {字体大小}px → {unified_font_size}px（全视频一致）")
         
+        segment_text_cache: Dict[int, Image.Image] = {}
+        if 动画特效 != "打字机":
+            for seg in segments:
+                display_text_cache = seg.text
+                if gradient_colors_list:
+                    cached_img = self.create_gradient_text(
+                        display_text_cache, font, gradient_colors_list, 渐变方向,
+                        stroke_color, 描边大小, width * 2, height * 2, 对齐方式, x_percent, 字体粗细
+                    )
+                else:
+                    cached_img = self.create_stroke_text(
+                        display_text_cache, font, text_color, stroke_color, 
+                        描边大小, width * 2, height * 2, 对齐方式, x_percent, 字体粗细
+                    )
+                segment_text_cache[seg.index] = cached_img
+        
         # 生成时间轴
         timeline_info = []
         for seg in segments:
@@ -1859,10 +2093,14 @@ class VideoSubtitleTimestampProNode:
             
             # 打字机效果特殊处理
             display_text = current_segment.text
+            visible_chars = -1
             if 动画特效 == "打字机" and "char_reveal" in anim_params:
-                char_count = int(len(current_segment.text) * anim_params.get("char_reveal", 1.0))
-                display_text = current_segment.text[:max(0, char_count)]
-                if not display_text:
+                # 计算需要显示的字符数（排除换行符，因为渲染时只计算可见字符）
+                clean_text_len = len(current_segment.text.replace('\n', ''))
+                visible_chars = int(clean_text_len * anim_params.get("char_reveal", 1.0))
+                
+                # 如果没有可见字符，输出空帧
+                if visible_chars == 0:
                     result = img_pil.convert('RGB')
                     result_array = np.array(result).astype(np.float32) / 255.0
                     output_images.append(result_array)
@@ -1871,16 +2109,21 @@ class VideoSubtitleTimestampProNode:
             
             # 使用统一字号（如果启用了自动缩放，已在前面计算）
             # 创建字幕图层（支持渐变色和字体粗细）
-            if gradient_colors_list:
-                text_img = self.create_gradient_text(
-                    display_text, font, gradient_colors_list, 渐变方向,
-                    stroke_color, 描边大小, width * 2, height * 2, 对齐方式, x_percent, 字体粗细
-                )
+            if 动画特效 != "打字机" and current_segment.index in segment_text_cache:
+                text_img = segment_text_cache[current_segment.index].copy()
             else:
-                text_img = self.create_stroke_text(
-                    display_text, font, text_color, stroke_color, 
-                    描边大小, width * 2, height * 2, 对齐方式, x_percent, 字体粗细
-                )
+                if gradient_colors_list:
+                    text_img = self.create_gradient_text(
+                        display_text, font, gradient_colors_list, 渐变方向,
+                        stroke_color, 描边大小, width * 2, height * 2, 对齐方式, 50.0, 字体粗细,
+                        visible_chars=visible_chars
+                    )
+                else:
+                    text_img = self.create_stroke_text(
+                        display_text, font, text_color, stroke_color, 
+                        描边大小, width * 2, height * 2, 对齐方式, 50.0, 字体粗细,
+                        visible_chars=visible_chars
+                    )
             
             # 应用缩放
             if anim_params.get("scale", 1.0) != 1.0 and anim_params["scale"] > 0:
@@ -1966,12 +2209,4 @@ class VideoSubtitleTimestampProNode:
         return (output_tensor, actual_start_time, actual_end_time)
 
 
-# ComfyUI节点映射
-NODE_CLASS_MAPPINGS = {
-    "HAIGC_VideoSubtitleTimestampPro": VideoSubtitleTimestampProNode
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "HAIGC_VideoSubtitleTimestampPro": "视频字幕时间戳(专业版) ⚡"
-}
-
+# 节点已在 __init__.py 中统一注册，此处不再重复注册

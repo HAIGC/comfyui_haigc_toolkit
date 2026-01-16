@@ -1,7 +1,12 @@
 """
-视频字幕添加节点 - 增强版（v2.5.0-stable）
+视频字幕添加节点 - 增强版（v2.6.0-stable）
 支持渐变、多段字幕、横竖排版、旋转等高级功能
 性能优化、质量提升、稳定性增强
+
+v2.6.0更新：
+  - 新增：去除标点符号功能（5种模式）
+  - 支持：中文标点、英文标点、所有标点、所有符号
+  - 增强：字幕文本预处理能力
 
 v2.5.0更新：
   - 对齐：与专业版节点参数顺序保持一致
@@ -30,13 +35,14 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import os
 import math
 import gc
+import re
 from collections import OrderedDict
 from typing import Tuple, Dict, Any, Optional
 import folder_paths
 import torch.nn.functional as F
 
 class VideoSubtitleEnhancedNode:
-    """视频字幕添加节点 - 增强版（v2.5.0-stable）
+    """视频字幕添加节点 - 增强版（v2.6.0-stable）
     
     特性：
     - 高性能渐变算法（使用numpy矢量化）
@@ -52,6 +58,7 @@ class VideoSubtitleEnhancedNode:
     - 位置预设和文字对齐（v2.3.0新增）
     - 优化参数排序布局（v2.4.0新增）
     - 与专业版参数顺序对齐（v2.5.0新增）
+    - 去除标点符号功能（v2.6.0新增）
     """
     
     # 使用OrderedDict实现LRU字体缓存
@@ -70,7 +77,10 @@ class VideoSubtitleEnhancedNode:
                 # === 📝 基础设置 ===
                 "images": ("IMAGE",),
                 "字幕文本": ("STRING", {
-                    "default": "这是字幕文本",
+                    "default": """这是视频添加时间戳字幕的节点
+作者网名：HAIGC(全网同名)
+作者微信号：HAIGC1994
+剪映接口只有早上到下午3点左右可以用""",
                     "multiline": True
                 }),
                 
@@ -82,6 +92,12 @@ class VideoSubtitleEnhancedNode:
                     "default": 48,
                     "min": 12,
                     "max": 300,
+                    "step": 1
+                }),
+                "最大行数": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 10,
                     "step": 1
                 }),
                 "字体粗细": (["常规", "粗体", "特粗", "超粗"], {
@@ -271,6 +287,9 @@ class VideoSubtitleEnhancedNode:
                     "max": 200,
                     "step": 1,
                     "display": "number"
+                }),
+                "去除标点符号": (["不去除", "中文标点", "英文标点", "所有标点", "所有符号"], {
+                    "default": "不去除"
                 }),
                 "限定在画布内": (["否", "自动缩放", "按字裁剪"], {
                     "default": "自动缩放"
@@ -494,8 +513,9 @@ class VideoSubtitleEnhancedNode:
     def create_gradient_text(self, text: str, font: ImageFont.FreeTypeFont, 
                            渐变效果: str, 开头颜色: str, 中间颜色: str, 末尾颜色: str, 
                            过渡强度: float, 排版方向: str = "横排", 字间距: int = 0,
-                           字体粗细: str = "常规") -> Image.Image:
-        """创建渐变文字图像（全功能版 - 支持字体粗细）"""
+                           字体粗细: str = "常规", align: str = "center",
+                           visible_chars: int = -1) -> Image.Image:
+        """创建渐变文字图像（全功能版 - 支持字体粗细、多行、Typing效果）"""
         
         # 计算文本尺寸
         temp_img = Image.new('RGBA', (1, 1))
@@ -517,20 +537,38 @@ class VideoSubtitleEnhancedNode:
             text_width = max_width
             text_height = total_height + (len(chars) - 1) * max(0, 字间距)
         else:
-            if 字间距 != 0:
-                chars = list(text.replace('\n', ''))
-                total_width = 0
-                max_height = 0
-                for char in chars:
-                    bbox = temp_draw.textbbox((0, 0), char, font=font)
-                    total_width += bbox[2] - bbox[0]
-                    max_height = max(max_height, bbox[3] - bbox[1])
-                text_width = total_width + (len(chars) - 1) * max(0, 字间距)
-                text_height = max_height
-            else:
-                bbox = temp_draw.textbbox((0, 0), text, font=font)
-                text_width = bbox[2] - bbox[0]
-                text_height = bbox[3] - bbox[1]
+            # 横排多行测量
+            lines = text.split('\n')
+            max_width = 0
+            total_height = 0
+            
+            bbox = temp_draw.textbbox((0, 0), "A", font=font)
+            line_height_default = bbox[3] - bbox[1]
+            line_gap = int(line_height_default * 0.2)
+            
+            for i, line in enumerate(lines):
+                if not line:
+                    total_height += line_height_default
+                else:
+                    chars = list(line)
+                    line_w = 0
+                    line_h = 0
+                    for char in chars:
+                        bbox = temp_draw.textbbox((0, 0), char, font=font)
+                        cw = bbox[2] - bbox[0]
+                        ch = bbox[3] - bbox[1]
+                        line_w += cw
+                        line_h = max(line_h, ch)
+                    
+                    line_w += (len(chars) - 1) * max(0, 字间距)
+                    max_width = max(max_width, line_w)
+                    total_height += line_h
+                
+                if i < len(lines) - 1:
+                    total_height += line_gap
+            
+            text_width = max_width
+            text_height = total_height
         
         # 添加边距
         padding = 50
@@ -542,35 +580,12 @@ class VideoSubtitleEnhancedNode:
         mid_rgb = self.parse_color(中间颜色)
         end_rgb = self.parse_color(末尾颜色)
         
-        # 如果无渐变，直接绘制纯色文字
         if 渐变效果 == "无":
             text_img = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(text_img)
-            
-            if 排版方向 == "竖排":
-                y_offset = padding
-                for char, char_width, char_height in char_info:
-                    x_offset = (canvas_width - char_width) // 2
-                    draw.text((x_offset, y_offset), char, font=font, fill=start_rgb + (255,))
-                    y_offset += char_height + max(0, 字间距)
-            else:
-                if 字间距 != 0:
-                    # 横排有字间距，逐字符绘制
-                    chars = list(text.replace('\n', ''))
-                    char_widths = []
-                    for char in chars:
-                        bbox = temp_draw.textbbox((0, 0), char, font=font)
-                        char_widths.append(bbox[2] - bbox[0])
-                    total_width = sum(char_widths) + (len(chars) - 1) * max(0, 字间距)
-                    x_offset = (canvas_width - total_width) // 2
-                    for char, char_width in zip(chars, char_widths):
-                        char_x = x_offset + char_width // 2
-                        draw.text((char_x, canvas_height // 2), char, 
-                                font=font, fill=start_rgb + (255,), anchor='mm')
-                        x_offset += char_width + max(0, 字间距)
-                else:
-                    draw.text((canvas_width // 2, canvas_height // 2), text, 
-                            font=font, fill=start_rgb + (255,), anchor='mm')
+            text_img = self._draw_text_with_bold(
+                text_img, text, font, start_rgb + (255,),
+                canvas_width, canvas_height, 字体粗细, 排版方向, 字间距, align, visible_chars
+            )
             return text_img
         
         # 创建渐变背景（高性能numpy版本）
@@ -584,54 +599,11 @@ class VideoSubtitleEnhancedNode:
         full_gradient.paste(gradient_img, (padding, padding))
         full_gradient = full_gradient.convert('RGBA')
         
-        # 创建文字遮罩（支持字体粗细）
         text_mask = Image.new('L', (canvas_width, canvas_height), 0)
-        mask_draw = ImageDraw.Draw(text_mask)
-        
-        if 排版方向 == "竖排":
-            y_offset = padding
-            for char, char_width, char_height in char_info:
-                x_offset = (canvas_width - char_width) // 2
-                
-                # 支持字体粗细
-                if 字体粗细 == "常规":
-                    mask_draw.text((x_offset, y_offset), char, font=font, fill=255)
-                else:
-                    self._draw_bold_char(mask_draw, (x_offset, y_offset), char, 
-                                       font, 255, 字体粗细)
-                
-                y_offset += char_height + max(0, 字间距)
-        else:
-            # 横排支持字体粗细+字间距
-            if 字间距 != 0:
-                # 有字间距，逐字符绘制
-                chars = list(text.replace('\n', ''))
-                temp_img = Image.new('L', (1, 1))
-                temp_draw = ImageDraw.Draw(temp_img)
-                char_widths = []
-                for char in chars:
-                    bbox = temp_draw.textbbox((0, 0), char, font=font)
-                    char_widths.append(bbox[2] - bbox[0])
-                total_width = sum(char_widths) + (len(chars) - 1) * max(0, 字间距)
-                x_offset = (canvas_width - total_width) // 2
-                
-                for char, char_width in zip(chars, char_widths):
-                    char_x = x_offset + char_width // 2
-                    if 字体粗细 == "常规":
-                        mask_draw.text((char_x, canvas_height // 2), char, 
-                                     font=font, fill=255, anchor='mm')
-                    else:
-                        self.create_bold_text(mask_draw, (char_x, canvas_height // 2), 
-                                            char, font, 255, 字体粗细)
-                    x_offset += char_width + max(0, 字间距)
-            else:
-                # 无字间距，整体绘制
-                if 字体粗细 == "常规":
-                    mask_draw.text((canvas_width // 2, canvas_height // 2), text, 
-                                  font=font, fill=255, anchor='mm')
-                else:
-                    self.create_bold_text(mask_draw, (canvas_width // 2, canvas_height // 2), 
-                                        text, font, 255, 字体粗细)
+        text_mask = self._draw_text_with_bold(
+            text_mask, text, font, 255,
+            canvas_width, canvas_height, 字体粗细, 排版方向, 字间距, align, visible_chars
+        )
         
         # 应用遮罩
         result = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
@@ -995,15 +967,25 @@ class VideoSubtitleEnhancedNode:
                           stroke_size: int, stroke_position: str, 
                           stroke_opacity: float, width: int, height: int, 
                           字间距: int = 0, 排版方向: str = "横排", 
-                          字体粗细: str = "常规") -> Image.Image:
+                          字体粗细: str = "常规", align: str = "center",
+                          visible_chars: int = -1) -> Image.Image:
         """创建描边文字（全功能版 - 支持横竖排+字体粗细）"""
         
         text_layer = Image.new('RGBA', (width, height), (0, 0, 0, 0))
         
+        # 映射对齐方式
+        pil_align = "left"
+        if align == "居中" or align == "center":
+            pil_align = "center"
+        elif align == "左对齐" or align == "left":
+            pil_align = "left"
+        elif align == "右对齐" or align == "right":
+            pil_align = "right"
+        
         if stroke_size == 0:
             # 无描边，直接绘制文字（支持粗细和排版）
             return self._draw_text_with_bold(text_layer, text, font, text_color + (255,), 
-                                            width, height, 字体粗细, 排版方向, 字间距)
+                                            width, height, 字体粗细, 排版方向, 字间距, pil_align, visible_chars)
         
         stroke_rgba = stroke_color + (int(255 * stroke_opacity),)
         
@@ -1017,6 +999,18 @@ class VideoSubtitleEnhancedNode:
         # 动态采样密度
         angle_step = 10 if stroke_size <= 5 else 15
         
+        # 预计算偏移量
+        offsets = []
+        for angle in range(0, 360, int(angle_step)):
+            rad = math.radians(angle)
+            cos_val = math.cos(rad)
+            sin_val = math.sin(rad)
+            for distance in range(1, stroke_size + 1):
+                offset_x = int(cos_val * distance)
+                offset_y = int(sin_val * distance)
+                if (offset_x, offset_y) not in offsets:
+                    offsets.append((offset_x, offset_y))
+
         if 排版方向 == "竖排":
             # 竖排描边 - 逐字符绘制
             chars = list(text.replace('\n', ''))
@@ -1039,93 +1033,143 @@ class VideoSubtitleEnhancedNode:
             
             # 绘制竖排描边
             for i, (char, char_height) in enumerate(zip(chars, char_heights)):
-                for angle in range(0, 360, angle_step):
-                    for distance in range(1, stroke_size + 1):
-                        offset_x = int(math.cos(math.radians(angle)) * distance)
-                        offset_y = int(math.sin(math.radians(angle)) * distance)
-                        
-                        # 绘制描边（支持粗细）
-                        if 字体粗细 == "常规":
-                            stroke_draw.text((center_x + offset_x, y_offset + offset_y), 
-                                           char, font=font, fill=stroke_rgba)
-                        else:
-                            self._draw_bold_char(stroke_draw, (center_x + offset_x, y_offset + offset_y), 
-                                               char, font, stroke_rgba, 字体粗细)
+                if visible_chars >= 0 and i >= visible_chars:
+                    break
+                for offset_x, offset_y in offsets:
+                    # 绘制描边（支持粗细）
+                    if 字体粗细 == "常规":
+                        stroke_draw.text((center_x + offset_x, y_offset + offset_y), 
+                                       char, font=font, fill=stroke_rgba, anchor='mm')
+                    else:
+                        self.create_bold_text(stroke_draw, (center_x + offset_x, y_offset + offset_y), 
+                                           char, font, stroke_rgba, 字体粗细, anchor='mm')
                 
                 y_offset += char_height + max(0, 字间距)
         else:
-            # 横排描边
-            if 字间距 != 0:
-                # 有字间距，逐字符绘制
-                chars = list(text.replace('\n', ''))
-                temp_img = Image.new('RGBA', (1, 1))
-                temp_draw = ImageDraw.Draw(temp_img)
-                
-                char_widths = []
-                for char in chars:
-                    bbox = temp_draw.textbbox((0, 0), char, font=font)
-                    char_widths.append(bbox[2] - bbox[0])
-                
-                total_width = sum(char_widths) + (len(chars) - 1) * max(0, 字间距)
-                start_x = (width - total_width) // 2
-                x_offset = start_x
-                
-                # 绘制横排描边（逐字符）
-                for char, char_width in zip(chars, char_widths):
-                    char_x = x_offset + char_width // 2
-                    for angle in range(0, 360, angle_step):
-                        for distance in range(1, stroke_size + 1):
-                            offset_x = int(math.cos(math.radians(angle)) * distance)
-                            offset_y = int(math.sin(math.radians(angle)) * distance)
-                            
-                            if 字体粗细 == "常规":
-                                stroke_draw.text((char_x + offset_x, center_y + offset_y),
-                                               char, font=font, fill=stroke_rgba, anchor='mm')
-                            else:
-                                self.create_bold_text(stroke_draw, (char_x + offset_x, center_y + offset_y),
-                                                    char, font, stroke_rgba, 字体粗细)
-                    x_offset += char_width + max(0, 字间距)
-            else:
-                # 无字间距，整体绘制
-                for angle in range(0, 360, angle_step):
-                    for distance in range(1, stroke_size + 1):
-                        offset_x = int(math.cos(math.radians(angle)) * distance)
-                        offset_y = int(math.sin(math.radians(angle)) * distance)
-                        
-                        # 绘制描边（支持粗细）
-                        if 字体粗细 == "常规":
-                            stroke_draw.text((center_x + offset_x, center_y + offset_y),
-                                           text, font=font, fill=stroke_rgba, anchor='mm')
-                        else:
-                            self.create_bold_text(stroke_draw, (center_x + offset_x, center_y + offset_y),
-                                                text, font, stroke_rgba, 字体粗细)
+            # 横排描边 (使用 _calculate_multiline_metrics 统一处理)
+            char_positions, _, _ = self._calculate_multiline_metrics(stroke_draw, text, font, 字间距, pil_align, width, height)
+            
+            # 绘制描边
+            for offset_x, offset_y in offsets:
+                for i, (char, x, y) in enumerate(char_positions):
+                    if visible_chars >= 0 and i >= visible_chars:
+                        break
+                    if 字体粗细 == "常规":
+                        stroke_draw.text((x + offset_x, y + offset_y), char, font=font, fill=stroke_rgba, anchor='mm')
+                    else:
+                        self.create_bold_text(stroke_draw, (x + offset_x, y + offset_y), char, font, stroke_rgba, 字体粗细, anchor='mm')
         
         # 根据描边位置合成
         if stroke_position == "外部":
             # 外部描边：先描边，后文字
             text_layer = Image.alpha_composite(text_layer, stroke_layer)
             text_layer = self._draw_text_with_bold(text_layer, text, font, text_color + (255,), 
-                                                   width, height, 字体粗细, 排版方向, 字间距)
+                                                   width, height, 字体粗细, 排版方向, 字间距, pil_align, visible_chars)
         elif stroke_position == "居中":
             # 居中描边：描边和文字混合
             text_layer = Image.alpha_composite(text_layer, stroke_layer)
             text_layer = self._draw_text_with_bold(text_layer, text, font, text_color + (255,), 
-                                                   width, height, 字体粗细, 排版方向, 字间距)
+                                                   width, height, 字体粗细, 排版方向, 字间距, pil_align, visible_chars)
         else:  # 内部
             # 内部描边：先文字，后用文字遮罩裁剪描边
             text_mask = Image.new('L', (width, height), 0)
             text_mask = self._draw_text_with_bold(text_mask, text, font, 255, 
-                                                  width, height, 字体粗细, 排版方向, 字间距)
+                                                  width, height, 字体粗细, 排版方向, 字间距, pil_align, visible_chars)
             stroke_layer.putalpha(text_mask.split()[0] if text_mask.mode == 'L' else text_mask)
             text_layer = self._draw_text_with_bold(text_layer, text, font, text_color + (255,), 
-                                                   width, height, 字体粗细, 排版方向, 字间距)
+                                                   width, height, 字体粗细, 排版方向, 字间距, pil_align, visible_chars)
             text_layer = Image.alpha_composite(text_layer, stroke_layer)
         
         return text_layer
     
+    def _calculate_multiline_metrics(self, draw, text, font, spacing, align, width, height):
+        """辅助函数：计算多行文字每个字符的位置"""
+        lines = text.split('\n')
+        line_metrics = []
+        max_block_width = 0
+        total_text_height = 0
+        
+        bbox = draw.textbbox((0, 0), "A", font=font)
+        default_line_height = bbox[3] - bbox[1]
+        line_gap = int(default_line_height * 0.2) # 行间距
+        
+        # 第一遍：计算尺寸
+        for i, line in enumerate(lines):
+            if not line:
+                line_metrics.append({'chars': [], 'width': 0, 'height': default_line_height})
+                total_text_height += default_line_height
+            else:
+                chars = list(line)
+                char_widths = []
+                max_line_height = 0
+                for char in chars:
+                    bbox = draw.textbbox((0, 0), char, font=font)
+                    char_widths.append(bbox[2] - bbox[0])
+                    max_line_height = max(max_line_height, bbox[3] - bbox[1])
+                
+                total_line_width = sum(char_widths) + (len(chars) - 1) * max(0, spacing)
+                line_metrics.append({
+                    'chars': chars,
+                    'char_widths': char_widths,
+                    'width': total_line_width,
+                    'height': max_line_height
+                })
+                max_block_width = max(max_block_width, total_line_width)
+                total_text_height += max_line_height
+            
+            if i < len(lines) - 1:
+                total_text_height += line_gap
+
+        # 垂直居中起始Y
+        current_y = (height - total_text_height) // 2
+        
+        # 块级水平位置（默认居中于画布）
+        block_start_x = (width - max_block_width) // 2
+        
+        char_positions = []
+        
+        # 第二遍：计算位置
+        for metric in line_metrics:
+            if not metric['chars']:
+                current_y += metric['height'] + line_gap
+                continue
+            
+            # 计算当前行X
+            if align == 'center':
+                start_x = (width - metric['width']) // 2
+            elif align == 'right':
+                start_x = block_start_x + (max_block_width - metric['width'])
+            else: # left
+                start_x = block_start_x
+            
+            current_x = start_x
+            for char, char_w in zip(metric['chars'], metric['char_widths']):
+                char_center_x = current_x + char_w // 2
+                char_center_y = current_y + metric['height'] // 2
+                char_positions.append((char, char_center_x, char_center_y))
+                current_x += char_w + max(0, spacing)
+            
+            current_y += metric['height'] + line_gap
+            
+        return char_positions, max_block_width, total_text_height
+
+    def _draw_multiline_text_with_spacing(self, draw, text, font, fill, width, height, spacing, align, bold_level, visible_chars=-1):
+        """辅助函数：绘制多行带字间距文字"""
+        char_positions, _, _ = self._calculate_multiline_metrics(draw, text, font, spacing, align, width, height)
+        
+        for i, (char, x, y) in enumerate(char_positions):
+            if visible_chars >= 0 and i >= visible_chars:
+                break
+                
+            if bold_level == "常规":
+                draw.text((x, y), char, font=font, fill=fill, anchor='mm')
+            else:
+                self.create_bold_text(draw, (x, y), char, font, fill, bold_level, anchor='mm')
+
     def _draw_text_with_bold(self, layer, text: str, font: ImageFont.FreeTypeFont, 
                             fill, width: int, height: int, bold_level: str, 
-                            direction: str, spacing: int):
+                            direction: str, spacing: int, align: str = "center",
+                            visible_chars: int = -1):
         """辅助函数：绘制支持粗细和排版的文字"""
         draw = ImageDraw.Draw(layer)
         center_x = width // 2
@@ -1145,43 +1189,29 @@ class VideoSubtitleEnhancedNode:
             total_height = sum(char_heights) + (len(chars) - 1) * max(0, spacing)
             y_offset = (height - total_height) // 2
             
-            for char, char_height in zip(chars, char_heights):
+            for i, (char, char_height) in enumerate(zip(chars, char_heights)):
+                if visible_chars >= 0 and i >= visible_chars:
+                    break
                 if bold_level == "常规":
-                    draw.text((center_x, y_offset), char, font=font, fill=fill)
+                    draw.text((center_x, y_offset + char_height//2), char, font=font, fill=fill, anchor='mm')
                 else:
-                    self._draw_bold_char(draw, (center_x, y_offset), char, font, fill, bold_level)
+                    self.create_bold_text(draw, (center_x, y_offset + char_height//2), char, font, fill, bold_level, anchor='mm')
                 y_offset += char_height + max(0, spacing)
         else:
             # 横排
             if spacing != 0:
-                # 有字间距时，逐字符绘制
-                chars = list(text.replace('\n', ''))
-                temp_img = Image.new('RGBA', (1, 1))
-                temp_draw = ImageDraw.Draw(temp_img)
-                
-                char_widths = []
-                max_height = 0
-                for char in chars:
-                    bbox = temp_draw.textbbox((0, 0), char, font=font)
-                    char_widths.append(bbox[2] - bbox[0])
-                    max_height = max(max_height, bbox[3] - bbox[1])
-                
-                total_width = sum(char_widths) + (len(chars) - 1) * max(0, spacing)
-                x_offset = (width - total_width) // 2
-                
-                for char, char_width in zip(chars, char_widths):
-                    char_x = x_offset + char_width // 2
-                    if bold_level == "常规":
-                        draw.text((char_x, center_y), char, font=font, fill=fill, anchor='mm')
-                    else:
-                        self.create_bold_text(draw, (char_x, center_y), char, font, fill, bold_level)
-                    x_offset += char_width + max(0, spacing)
+                self._draw_multiline_text_with_spacing(draw, text, font, fill, width, height, spacing, align, bold_level, visible_chars)
             else:
-                # 无字间距时，整体绘制
-                if bold_level == "常规":
-                    draw.text((center_x, center_y), text, font=font, fill=fill, anchor='mm')
+                # 无字间距时，整体绘制（注意：这里如果是多行且无字间距，可能无法正确应用typing效果）
+                # 为了支持typing效果，即使字间距为0，也建议走multiline逻辑
+                # 但为了保持兼容性，如果visible_chars被设置，我们强制走multiline逻辑
+                if visible_chars >= 0 or '\n' in text:
+                    self._draw_multiline_text_with_spacing(draw, text, font, fill, width, height, spacing, align, bold_level, visible_chars)
                 else:
-                    self.create_bold_text(draw, (center_x, center_y), text, font, fill, bold_level)
+                    if bold_level == "常规":
+                        draw.text((center_x, center_y), text, font=font, fill=fill, anchor='mm', align=align)
+                    else:
+                        self.create_bold_text(draw, (center_x, center_y), text, font, fill, bold_level, align=align, anchor='mm')
         
         return layer
     
@@ -1452,21 +1482,89 @@ class VideoSubtitleEnhancedNode:
         
         return result
     
+    def remove_punctuation(self, text: str, mode: str) -> str:
+        """去除标点符号
+        
+        Args:
+            text: 输入文本
+            mode: 去除模式（不去除、中文标点、英文标点、所有标点、所有符号）
+        
+        Returns:
+            处理后的文本
+        """
+        if mode == "不去除":
+            return text
+        
+        if mode == "中文标点":
+            chinese_punctuation = "，。！？、；：""''（）【】《》〈〉「」『』〔〕…—·～"
+            for punct in chinese_punctuation:
+                text = text.replace(punct, "")
+        
+        elif mode == "英文标点":
+            english_punctuation = ",.!?;:'\"()[]<>{}-"
+            for punct in english_punctuation:
+                text = text.replace(punct, "")
+        
+        elif mode == "所有标点":
+            all_punctuation = "，。！？、；：""''（）【】《》〈〉「」『』〔〕…—·～,.!?;:'\"()[]<>{}-"
+            for punct in all_punctuation:
+                text = text.replace(punct, "")
+        
+        elif mode == "所有符号":
+            text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9\s\n]', '', text)
+        
+        return text
+    
+    def wrap_text_smart(self, text: str, font: ImageFont.FreeTypeFont, max_width: int, max_lines: int) -> str:
+        """智能文本换行"""
+        if max_lines <= 1 or not text or '\n' in text:
+            return text
+            
+        try:
+            # 使用临时画布测量宽度
+            draw = ImageDraw.Draw(Image.new('L', (1, 1)))
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+        except:
+            return text
+            
+        if text_width <= max_width:
+            return text
+            
+        # 计算需要的行数
+        num_lines = min(max_lines, math.ceil(text_width / max_width))
+        if num_lines <= 1:
+            return text
+            
+        # 均匀分割
+        length = len(text)
+        chunk_size = math.ceil(length / num_lines)
+        lines = [text[i:i+chunk_size] for i in range(0, length, chunk_size)]
+        
+        return "\n".join(lines)
+
     def add_subtitle(self, images, 字幕文本,
-                    字体选择, 字体大小, 字体粗细, 字体颜色, 不透明度,
+                    字体选择, 字体大小, 最大行数, 字体粗细, 字体颜色, 不透明度,
                     描边大小, 描边颜色, 描边位置, 描边不透明度,
                     投影角度, 投影距离, 投影强度, 投影模糊,
                     位置预设, 文字对齐, 位置X百分比, 位置Y百分比, 排版方向, 字体角度,
                     渐变效果, 渐变开头颜色, 渐变中间颜色, 渐变末尾颜色, 渐变过渡强度,
                     动效类型, 动效强度, 动效时长, 动效速度调节,
                     开始时间, 结束时间, 时间单位, 视频帧率,
-                    字间距, 限定在画布内):
-        """添加字幕（v2.5.0 - 对齐专业版参数顺序）"""
+                    字间距, 去除标点符号, 限定在画布内):
+        """添加字幕（v2.6.0 - 新增去除标点符号功能）"""
         
         # 输入验证
         if not 字幕文本 or not 字幕文本.strip():
             print("警告: 字幕文本为空，跳过处理")
             return (images, 开始时间, 结束时间)
+        
+        # 应用去除标点符号功能
+        if 去除标点符号 != "不去除":
+            原始文本 = 字幕文本
+            字幕文本 = self.remove_punctuation(字幕文本, 去除标点符号)
+            if 字幕文本 != 原始文本:
+                print(f"[去除标点] 模式:{去除标点符号}, 原长度:{len(原始文本)}, 新长度:{len(字幕文本)}")
         
         batch_size = images.shape[0]
         height = images.shape[1]
@@ -1485,6 +1583,16 @@ class VideoSubtitleEnhancedNode:
             动效时长帧数 = max(1, int(动效时长 / 动效速度调节))
         
         end_frame = min(end_frame, batch_size)
+        
+        # 智能换行处理
+        if 最大行数 > 1 and 排版方向 == "横排":
+            # 预先获取字体用于测量（使用初始字号）
+            temp_font = self.get_cached_font(字体选择, 字体大小)
+            if temp_font:
+                # 留5%边距
+                wrap_width = int(width * 0.9)
+                print(f"[智能换行] 最大行数: {最大行数}, 限制宽度: {wrap_width}px")
+                字幕文本 = self.wrap_text_smart(字幕文本, temp_font, wrap_width, 最大行数)
         
         # 如果启用自动缩放，先计算最优字号
         final_font_size = 字体大小
@@ -1530,8 +1638,69 @@ class VideoSubtitleEnhancedNode:
         
         print(f"[文字对齐] {文字对齐}, 位置: X={位置X百分比:.1f}%, Y={位置Y百分比:.1f}%")
         
+        pil_align = "center"
+        if 文字对齐 == "左对齐":
+            pil_align = "left"
+        elif 文字对齐 == "右对齐":
+            pil_align = "right"
+            
         # GPU内存优化：批量处理前先移到CPU
         images_cpu = images.cpu()
+        
+        canvas_width = width * 2
+        canvas_height = height * 2
+        base_text_img = None
+        if 动效类型 != "打字机":
+            display_text_base = 字幕文本
+            if 描边大小 > 0 and 渐变效果 != "无":
+                base_text_img = self.create_gradient_text(
+                    display_text_base, font, 渐变效果,
+                    渐变开头颜色, 渐变中间颜色, 渐变末尾颜色, 渐变过渡强度, 排版方向, 字间距, 字体粗细
+                )
+            elif 描边大小 > 0:
+                base_text_img = self.create_stroke_text(
+                    display_text_base, font, text_color, stroke_color, 描边大小,
+                    描边位置, 描边不透明度, canvas_width, canvas_height, 
+                    字间距, 排版方向, 字体粗细
+                )
+            elif 渐变效果 != "无":
+                base_text_img = self.create_gradient_text(
+                    display_text_base, font, 渐变效果,
+                    渐变开头颜色, 渐变中间颜色, 渐变末尾颜色, 渐变过渡强度, 排版方向, 字间距, 字体粗细
+                )
+            elif 排版方向 == "竖排":
+                base_text_img = self.create_vertical_text(display_text_base, font, text_color, 字间距, 字体粗细)
+            else:
+                temp_img = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
+                temp_draw = ImageDraw.Draw(temp_img)
+                alpha_full = 255
+                if 字间距 != 0:
+                    chars = list(display_text_base.replace('\n', ''))
+                    measure_img = Image.new('RGBA', (1, 1))
+                    measure_draw = ImageDraw.Draw(measure_img)
+                    char_widths = []
+                    for char in chars:
+                        bbox = measure_draw.textbbox((0, 0), char, font=font)
+                        char_widths.append(bbox[2] - bbox[0])
+                    total_width = sum(char_widths) + (len(chars) - 1) * max(0, 字间距)
+                    x_offset = (canvas_width - total_width) // 2
+                    for char, char_width in zip(chars, char_widths):
+                        char_x = x_offset + char_width // 2
+                        if 字体粗细 == "常规":
+                            temp_draw.text((char_x, canvas_height//2), char, 
+                                         font=font, fill=text_color + (alpha_full,), anchor='mm')
+                        else:
+                            self.create_bold_text(temp_draw, (char_x, canvas_height//2), 
+                                                char, font, text_color + (alpha_full,), 字体粗细)
+                        x_offset += char_width + max(0, 字间距)
+                else:
+                    if 字体粗细 == "常规":
+                        temp_draw.text((canvas_width//2, canvas_height//2), display_text_base, 
+                                     font=font, fill=text_color + (alpha_full,), anchor='mm', align=pil_align)
+                    else:
+                        self.create_bold_text(temp_draw, (canvas_width//2, canvas_height//2), 
+                                            display_text_base, font, text_color + (alpha_full,), 字体粗细, align=pil_align)
+                base_text_img = temp_img
         
         for i in range(batch_size):
             # 定期清理GPU显存（每100帧清理一次）
@@ -1574,101 +1743,85 @@ class VideoSubtitleEnhancedNode:
             
             # 打字机效果
             display_text = 字幕文本
+            visible_chars = -1
             if 动效类型 == "打字机":
                 char_count = int(len(字幕文本) * anim_params["char_reveal"])
-                display_text = 字幕文本[:max(0, char_count)]
-                if not display_text:
-                    result = img_pil.convert('RGB')
-                    result_array = np.array(result).astype(np.float32) / 255.0
-                    output_images.append(result_array)
-                    continue
+                # 对于复杂效果（描边/渐变/竖排），暂时使用截断文本（可能会有抖动）
+                # 对于标准绘制，使用visible_chars实现无抖动打字机
+                is_complex_style = (描边大小 > 0) or (渐变效果 != "无") or (排版方向 == "竖排")
+                
+                if is_complex_style:
+                    display_text = 字幕文本[:max(0, char_count)]
+                    if not display_text:
+                        result = img_pil.convert('RGB')
+                        result_array = np.array(result).astype(np.float32) / 255.0
+                        output_images.append(result_array)
+                        continue
+                else:
+                    # 标准模式，传递完整文本和可见字符数
+                    display_text = 字幕文本
+                    visible_chars = max(0, char_count)
+                    if visible_chars == 0:
+                        result = img_pil.convert('RGB')
+                        result_array = np.array(result).astype(np.float32) / 255.0
+                        output_images.append(result_array)
+                        continue
             
             # 创建文字图层
             canvas_width = width * 2
             canvas_height = height * 2
             
             # 全功能渲染逻辑（支持所有组合）
-            if 描边大小 > 0 and 渐变效果 != "无":
-                # 描边 + 渐变组合（优先渐变）
-                text_img = self.create_gradient_text(
-                    display_text, font, 渐变效果,
-                    渐变开头颜色, 渐变中间颜色, 渐变末尾颜色, 渐变过渡强度, 排版方向, 字间距, 字体粗细
-                )
+            if base_text_img is not None and 动效类型 != "打字机":
+                text_img = base_text_img.copy()
                 if 不透明度 < 1.0 or anim_params["opacity"] < 1.0:
                     combined_opacity = 不透明度 * anim_params["opacity"]
                     alpha_mask = text_img.split()[3].point(lambda p: int(p * combined_opacity))
                     text_img.putalpha(alpha_mask)
-                    
-            elif 描边大小 > 0:
-                # 描边文字（支持横竖排+字体粗细）
-                text_img = self.create_stroke_text(
-                    display_text, font, text_color, stroke_color, 描边大小,
-                    描边位置, 描边不透明度, canvas_width, canvas_height, 
-                    字间距, 排版方向, 字体粗细
-                )
-                if 不透明度 < 1.0 or anim_params["opacity"] < 1.0:
-                    combined_opacity = 不透明度 * anim_params["opacity"]
-                    alpha_mask = text_img.split()[3].point(lambda p: int(p * combined_opacity))
-                    text_img.putalpha(alpha_mask)
-                    
-            elif 渐变效果 != "无":
-                # 渐变文字（支持横竖排+字体粗细）
-                text_img = self.create_gradient_text(
-                    display_text, font, 渐变效果,
-                    渐变开头颜色, 渐变中间颜色, 渐变末尾颜色, 渐变过渡强度, 排版方向, 字间距, 字体粗细
-                )
-                if 不透明度 < 1.0 or anim_params["opacity"] < 1.0:
-                    combined_opacity = 不透明度 * anim_params["opacity"]
-                    alpha_mask = text_img.split()[3].point(lambda p: int(p * combined_opacity))
-                    text_img.putalpha(alpha_mask)
-                    
-            elif 排版方向 == "竖排":
-                # 纯色竖排文字（支持字体粗细）
-                text_img = self.create_vertical_text(display_text, font, text_color, 字间距, 字体粗细)
-                if 不透明度 < 1.0 or anim_params["opacity"] < 1.0:
-                    combined_opacity = 不透明度 * anim_params["opacity"]
-                    alpha_mask = text_img.split()[3].point(lambda p: int(p * combined_opacity))
-                    text_img.putalpha(alpha_mask)
-                    
             else:
-                # 纯色横排文字（支持字体粗细+字间距）
-                temp_img = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
-                temp_draw = ImageDraw.Draw(temp_img)
-                alpha = int(255 * 不透明度 * anim_params["opacity"])
-                
-                if 字间距 != 0:
-                    # 有字间距时，逐字符绘制
-                    chars = list(display_text.replace('\n', ''))
-                    measure_img = Image.new('RGBA', (1, 1))
-                    measure_draw = ImageDraw.Draw(measure_img)
-                    
-                    char_widths = []
-                    for char in chars:
-                        bbox = measure_draw.textbbox((0, 0), char, font=font)
-                        char_widths.append(bbox[2] - bbox[0])
-                    
-                    total_width = sum(char_widths) + (len(chars) - 1) * max(0, 字间距)
-                    x_offset = (canvas_width - total_width) // 2
-                    
-                    for char, char_width in zip(chars, char_widths):
-                        char_x = x_offset + char_width // 2
-                        if 字体粗细 == "常规":
-                            temp_draw.text((char_x, canvas_height//2), char, 
-                                         font=font, fill=text_color + (alpha,), anchor='mm')
-                        else:
-                            self.create_bold_text(temp_draw, (char_x, canvas_height//2), 
-                                                char, font, text_color + (alpha,), 字体粗细)
-                        x_offset += char_width + max(0, 字间距)
+                if 描边大小 > 0 and 渐变效果 != "无":
+                    text_img = self.create_gradient_text(
+                        display_text, font, 渐变效果,
+                        渐变开头颜色, 渐变中间颜色, 渐变末尾颜色, 渐变过渡强度, 排版方向, 字间距, 字体粗细
+                    )
+                    if 不透明度 < 1.0 or anim_params["opacity"] < 1.0:
+                        combined_opacity = 不透明度 * anim_params["opacity"]
+                        alpha_mask = text_img.split()[3].point(lambda p: int(p * combined_opacity))
+                        text_img.putalpha(alpha_mask)
+                elif 描边大小 > 0:
+                    text_img = self.create_stroke_text(
+                        display_text, font, text_color, stroke_color, 描边大小,
+                        描边位置, 描边不透明度, canvas_width, canvas_height, 
+                        字间距, 排版方向, 字体粗细
+                    )
+                    if 不透明度 < 1.0 or anim_params["opacity"] < 1.0:
+                        combined_opacity = 不透明度 * anim_params["opacity"]
+                        alpha_mask = text_img.split()[3].point(lambda p: int(p * combined_opacity))
+                        text_img.putalpha(alpha_mask)
+                elif 渐变效果 != "无":
+                    text_img = self.create_gradient_text(
+                        display_text, font, 渐变效果,
+                        渐变开头颜色, 渐变中间颜色, 渐变末尾颜色, 渐变过渡强度, 排版方向, 字间距, 字体粗细
+                    )
+                    if 不透明度 < 1.0 or anim_params["opacity"] < 1.0:
+                        combined_opacity = 不透明度 * anim_params["opacity"]
+                        alpha_mask = text_img.split()[3].point(lambda p: int(p * combined_opacity))
+                        text_img.putalpha(alpha_mask)
+                elif 排版方向 == "竖排":
+                    text_img = self.create_vertical_text(display_text, font, text_color, 字间距, 字体粗细)
+                    if 不透明度 < 1.0 or anim_params["opacity"] < 1.0:
+                        combined_opacity = 不透明度 * anim_params["opacity"]
+                        alpha_mask = text_img.split()[3].point(lambda p: int(p * combined_opacity))
+                        text_img.putalpha(alpha_mask)
                 else:
-                    # 无字间距时，整体绘制
-                    if 字体粗细 == "常规":
-                        temp_draw.text((canvas_width//2, canvas_height//2), display_text, 
-                                     font=font, fill=text_color + (alpha,), anchor='mm')
-                    else:
-                        self.create_bold_text(temp_draw, (canvas_width//2, canvas_height//2), 
-                                            display_text, font, text_color + (alpha,), 字体粗细)
-                
-                text_img = temp_img
+                    temp_img = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
+                    temp_draw = ImageDraw.Draw(temp_img)
+                    alpha = int(255 * 不透明度 * anim_params["opacity"])
+                    self._draw_multiline_text_with_spacing(
+                        temp_draw, display_text, font, text_color + (alpha,),
+                        canvas_width, canvas_height, 字间距, pil_align, 字体粗细
+                    )
+                    text_img = temp_img
             
             # 应用缩放（使用高质量LANCZOS算法）
             if anim_params["scale"] != 1.0 and anim_params["scale"] > 0:
@@ -1746,11 +1899,4 @@ class VideoSubtitleEnhancedNode:
         return (output_tensor, 开始时间, 结束时间)
 
 
-# ComfyUI节点映射
-NODE_CLASS_MAPPINGS = {
-    "HAIGC_VideoSubtitleEnhanced": VideoSubtitleEnhancedNode
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "HAIGC_VideoSubtitleEnhanced": "视频字幕增强版(优化) 🎬"
-}
+# 节点已在 __init__.py 中统一注册，此处不再重复注册
